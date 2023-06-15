@@ -43,7 +43,6 @@ public:
         const StoredObject & object,
         WriteMode mode,
         std::optional<ObjectAttributes> attributes = {},
-        FinalizeCallback && finalize_callback = {},
         size_t buf_size = DBMS_DEFAULT_BUFFER_SIZE,
         const WriteSettings & write_settings = {}) override;
 
@@ -72,7 +71,7 @@ public:
         const std::string & config_prefix,
         ContextPtr context) override;
 
-    void listPrefix(const std::string & path, RelativePathsWithSize & children) const override;
+    void listObjects(const std::string & path, RelativePathsWithMetadata & children, int max_keys) const override;
 
     ObjectMetadata getObjectMetadata(const std::string & path) const override;
 
@@ -87,7 +86,7 @@ public:
 
     String getObjectsNamespace() const override;
 
-    const String & getCacheBasePath() const override { return cache->getBasePath(); }
+    const std::string & getCacheName() const override { return cache_config_name; }
 
     std::string generateBlobNameForPath(const std::string & path) override;
 
@@ -101,6 +100,8 @@ public:
 
     bool isReadOnly() const override { return object_storage->isReadOnly(); }
 
+    bool isWriteOnce() const override { return object_storage->isWriteOnce(); }
+
     const std::string & getCacheConfigName() const { return cache_config_name; }
 
     ObjectStoragePtr getWrappedObjectStorage() { return object_storage; }
@@ -111,10 +112,12 @@ public:
 
     WriteSettings getAdjustedSettingsFromMetadataFile(const WriteSettings & settings, const std::string & path) const override;
 
+    const FileCacheSettings & getCacheSettings() const { return cache_settings; }
+
+    static bool canUseReadThroughCache(const ReadSettings & settings);
+
 private:
     FileCache::Key getCacheKey(const std::string & path) const;
-
-    String getCachePath(const std::string & path) const;
 
     ReadSettings patchSettings(const ReadSettings & read_settings) const override;
 

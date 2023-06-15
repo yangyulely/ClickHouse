@@ -34,11 +34,12 @@ using TestKeeperRequestPtr = std::shared_ptr<TestKeeperRequest>;
 class TestKeeper final : public IKeeper
 {
 public:
-    TestKeeper(const zkutil::ZooKeeperArgs & args_);
+    explicit TestKeeper(const zkutil::ZooKeeperArgs & args_);
     ~TestKeeper() override;
 
     bool isExpired() const override { return expired; }
     int64_t getSessionID() const override { return 0; }
+    Poco::Net::SocketAddress getConnectedAddress() const override { return connected_zk_address; }
 
 
     void create(
@@ -91,7 +92,7 @@ public:
 
     void finalize(const String & reason) override;
 
-    DB::KeeperApiVersion getApiVersion() override
+    DB::KeeperApiVersion getApiVersion() const override
     {
         return KeeperApiVersion::ZOOKEEPER_COMPATIBLE;
     }
@@ -126,6 +127,8 @@ private:
 
     zkutil::ZooKeeperArgs args;
 
+    Poco::Net::SocketAddress connected_zk_address;
+
     std::mutex push_request_mutex;
     std::atomic<bool> expired{false};
 
@@ -146,4 +149,3 @@ private:
 };
 
 }
-

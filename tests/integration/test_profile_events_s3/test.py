@@ -31,36 +31,8 @@ def cluster():
         cluster.shutdown()
 
 
-init_list = {
-    "ReadBufferFromS3Bytes": 0,
-    "ReadBufferFromS3Microseconds": 0,
-    "ReadBufferFromS3RequestsErrors": 0,
-    "WriteBufferFromS3Bytes": 0,
-    "S3ReadMicroseconds": 0,
-    "S3ReadRequestsCount": 0,
-    "S3ReadRequestsErrorsTotal": 0,
-    "S3ReadRequestsErrors503": 0,
-    "S3ReadRequestsRedirects": 0,
-    "S3WriteMicroseconds": 0,
-    "S3WriteRequestsCount": 0,
-    "S3WriteRequestsErrorsTotal": 0,
-    "S3WriteRequestsErrors503": 0,
-    "S3WriteRequestsRedirects": 0,
-    "DiskS3ReadMicroseconds": 0,
-    "DiskS3ReadRequestsCount": 0,
-    "DiskS3ReadRequestsErrorsTotal": 0,
-    "DiskS3ReadRequestsErrors503": 0,
-    "DiskS3ReadRequestsRedirects": 0,
-    "DiskS3WriteMicroseconds": 0,
-    "DiskS3WriteRequestsCount": 0,
-    "DiskS3WriteRequestsErrorsTotal": 0,
-    "DiskS3WriteRequestsErrors503": 0,
-    "DiskS3WriteRequestsRedirects": 0,
-}
-
-
 def get_s3_events(instance):
-    result = init_list.copy()
+    result = dict()
     events = instance.query(
         "SELECT event, value FROM system.events WHERE event LIKE '%S3%'"
     ).split("\n")
@@ -105,7 +77,7 @@ def get_minio_stat(cluster):
 
 
 def get_query_stat(instance, hint):
-    result = init_list.copy()
+    result = dict()
     instance.query("SYSTEM FLUSH LOGS")
     events = instance.query(
         """
@@ -121,7 +93,10 @@ def get_query_stat(instance, hint):
         ev = event.split("\t")
         if len(ev) == 2:
             if "S3" in ev[0]:
-                result[ev[0]] += int(ev[1])
+                if ev[0] in result:
+                    result[ev[0]] += int(ev[1])
+                else:
+                    result[ev[0]] = int(ev[1])
     return result
 
 
