@@ -2,9 +2,11 @@
 
 #include <Processors/Formats/Impl/Parquet/ThriftUtil.h>
 #include <Columns/IColumn.h>
+#include <Core/Block.h>
 #include <DataTypes/IDataType.h>
 #include <Common/PODArray.h>
 #include <IO/CompressionMethod.h>
+#include <generated/parquet_types.h>
 
 namespace DB::Parquet
 {
@@ -42,7 +44,8 @@ struct ColumnChunkWriteState
 
     ColumnPtr primitive_column;
     CompressionMethod compression; // must match what's inside column_chunk
-    bool is_bool = false;
+    Int64 datetime64_multiplier = 1; // for converting e.g. seconds to milliseconds
+    bool is_bool = false; // bool vs UInt8 have the same column type but are encoded differently
 
     /// Repetition and definition levels. Produced by prepareColumnForWrite().
     /// def is empty iff max_def == 0, which means no arrays or nullables.
@@ -52,6 +55,9 @@ struct ColumnChunkWriteState
     /// Max possible levels, according to schema. Actual max in def/rep may be smaller.
     UInt8 max_def = 0;
     UInt8 max_rep = 0;
+
+    parquet::format::ColumnIndex column_index;
+    parquet::format::OffsetIndex offset_index;
 
     ColumnChunkWriteState() = default;
     /// Prevent accidental copying.
@@ -131,6 +137,7 @@ parquet::format::ColumnChunk finalizeColumnChunkAndWriteFooter(
 
 parquet::format::RowGroup makeRowGroup(std::vector<parquet::format::ColumnChunk> column_chunks, size_t num_rows);
 
+void writePageIndex(const std::vector<std::vector<parquet::format::ColumnIndex>>& column_indexes, const std::vector<std::vector<parquet::format::OffsetIndex>>& offset_indexes, std::vector<parquet::format::RowGroup>& row_groups, WriteBuffer & out, size_t base_offset);
 void writeFileFooter(std::vector<parquet::format::RowGroup> row_groups, SchemaElements schema, const WriteOptions & options, WriteBuffer & out);
 
 }

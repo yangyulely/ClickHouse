@@ -32,11 +32,8 @@ public:
 
     void onFinish() override
     {
-        UInt128 key;
-        String key_str;
-
-        new_hash->get128(key);
-        key_str = getHexUIntLowercase(key);
+        const auto key = new_hash->get128();
+        const auto key_str = getHexUIntLowercase(key);
 
         std::lock_guard lock(storage.mutex);
 
@@ -74,9 +71,9 @@ public:
         new_hash.reset();
     }
 
-    void consume(Chunk chunk) override
+    void consume(Chunk & chunk) override
     {
-        auto block = getHeader().cloneWithColumns(chunk.detachColumns());
+        auto block = getHeader().cloneWithColumns(chunk.getColumns());
         block.updateHash(*new_hash);
         new_blocks->push_back(std::move(block));
     }

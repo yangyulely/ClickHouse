@@ -2,6 +2,7 @@
 #include <IO/WriteHelpers.h>
 #include <IO/Operators.h>
 #include <Columns/ColumnSparse.h>
+#include <Columns/ColumnConst.h>
 #include <DataTypes/DataTypeLowCardinality.h>
 
 namespace DB
@@ -14,12 +15,6 @@ namespace ErrorCodes
 }
 
 Chunk::Chunk(DB::Columns columns_, UInt64 num_rows_) : columns(std::move(columns_)), num_rows(num_rows_)
-{
-    checkNumRowsIsConsistent();
-}
-
-Chunk::Chunk(Columns columns_, UInt64 num_rows_, ChunkInfoPtr chunk_info_)
-    : columns(std::move(columns_)), num_rows(num_rows_), chunk_info(std::move(chunk_info_))
 {
     checkNumRowsIsConsistent();
 }
@@ -40,15 +35,11 @@ Chunk::Chunk(MutableColumns columns_, UInt64 num_rows_)
     checkNumRowsIsConsistent();
 }
 
-Chunk::Chunk(MutableColumns columns_, UInt64 num_rows_, ChunkInfoPtr chunk_info_)
-    : columns(unmuteColumns(std::move(columns_))), num_rows(num_rows_), chunk_info(std::move(chunk_info_))
-{
-    checkNumRowsIsConsistent();
-}
-
 Chunk Chunk::clone() const
 {
-    return Chunk(getColumns(), getNumRows(), chunk_info);
+    auto tmp = Chunk(getColumns(), getNumRows());
+    tmp.setChunkInfos(chunk_infos.clone());
+    return tmp;
 }
 
 void Chunk::setColumns(Columns columns_, UInt64 num_rows_)
@@ -72,7 +63,7 @@ void Chunk::checkNumRowsIsConsistent()
         auto & column = columns[i];
         if (column->size() != num_rows)
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Invalid number of rows in Chunk column {}: expected {}, got {}",
-                            column->getName()+ " position " + toString(i), toString(num_rows), toString(column->size()));
+                            column->getName() + " position " + toString(i), toString(num_rows), toString(column->size()));
     }
 }
 
@@ -120,7 +111,7 @@ void Chunk::addColumn(size_t position, ColumnPtr column)
     if (position >= columns.size())
         throw Exception(ErrorCodes::POSITION_OUT_OF_BOUND,
                         "Position {} out of bound in Chunk::addColumn(), max position = {}",
-                        position, columns.size() - 1);
+                        position, !columns.empty() ? columns.size() - 1 : 0);
     if (empty())
         num_rows = column->size();
     else if (column->size() != num_rows)
@@ -138,7 +129,7 @@ void Chunk::erase(size_t position)
 
     if (position >= columns.size())
         throw Exception(ErrorCodes::POSITION_OUT_OF_BOUND, "Position {} out of bound in Chunk::erase(), max position = {}",
-                        toString(position), toString(columns.size() - 1));
+                        toString(position), toString(!columns.empty() ? columns.size() - 1 : 0));
 
     columns.erase(columns.begin() + position);
 }
@@ -187,22 +178,6 @@ void Chunk::append(const Chunk & chunk, size_t from, size_t length)
     setColumns(std::move(mutable_columns), rows);
 }
 
-void ChunkMissingValues::setBit(size_t column_idx, size_t row_idx)
-{
-    RowsBitMask & mask = rows_mask_by_column_id[column_idx];
-    mask.resize(row_idx + 1);
-    mask[row_idx] = true;
-}
-
-const ChunkMissingValues::RowsBitMask & ChunkMissingValues::getDefaultsBitmask(size_t column_idx) const
-{
-    static RowsBitMask none;
-    auto it = rows_mask_by_column_id.find(column_idx);
-    if (it != rows_mask_by_column_id.end())
-        return it->second;
-    return none;
-}
-
 void convertToFullIfConst(Chunk & chunk)
 {
     size_t num_rows = chunk.getNumRows();
@@ -219,6 +194,18 @@ void convertToFullIfSparse(Chunk & chunk)
     for (auto & column : columns)
         column = recursiveRemoveSparse(column);
     chunk.setColumns(std::move(columns), num_rows);
+}
+
+Chunk cloneConstWithDefault(const Chunk & chunk, size_t num_rows)
+{
+    auto columns = chunk.cloneEmptyColumns();
+    for (auto & column : columns)
+    {
+        column->insertDefault();
+        column = ColumnConst::create(std::move(column), num_rows);
+    }
+
+    return Chunk(std::move(columns), num_rows);
 }
 
 }

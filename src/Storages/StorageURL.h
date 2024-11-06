@@ -1,17 +1,17 @@
 #pragma once
 
-#include <Poco/URI.h>
-#include <Processors/Sinks/SinkToStorage.h>
-#include <Processors/ISource.h>
 #include <Formats/FormatSettings.h>
 #include <IO/CompressionMethod.h>
-#include <IO/ReadWriteBufferFromHTTP.h>
 #include <IO/HTTPHeaderEntries.h>
-#include <Storages/IStorage.h>
-#include <Storages/StorageFactory.h>
+#include <IO/ReadWriteBufferFromHTTP.h>
+#include <Processors/SourceWithKeyCondition.h>
+#include <Processors/Sinks/SinkToStorage.h>
 #include <Storages/Cache/SchemaCache.h>
+#include <Storages/IStorage.h>
 #include <Storages/StorageConfiguration.h>
+#include <Storages/StorageFactory.h>
 #include <Storages/prepareReadingFromFormat.h>
+#include <Poco/URI.h>
 
 
 namespace DB
@@ -34,7 +34,8 @@ class PullingPipelineExecutor;
 class IStorageURLBase : public IStorage
 {
 public:
-    Pipe read(
+    void read(
+        QueryPlan & query_plan,
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,
@@ -47,22 +48,36 @@ public:
 
     bool supportsPartitionBy() const override { return true; }
 
-    NamesAndTypesList getVirtuals() const override;
-
     static ColumnsDescription getTableStructureFromData(
         const String & format,
         const String & uri,
         CompressionMethod compression_method,
         const HTTPHeaderEntries & headers,
         const std::optional<FormatSettings> & format_settings,
-        ContextPtr context);
+        const ContextPtr & context);
+
+    static std::pair<ColumnsDescription, String> getTableStructureAndFormatFromData(
+        const String & uri,
+        CompressionMethod compression_method,
+        const HTTPHeaderEntries & headers,
+        const std::optional<FormatSettings> & format_settings,
+        const ContextPtr & context);
+
 
     static SchemaCache & getSchemaCache(const ContextPtr & context);
 
+    static std::optional<time_t> tryGetLastModificationTime(
+        const String & url,
+        const HTTPHeaderEntries & headers,
+        const Poco::Net::HTTPBasicCredentials & credentials,
+        const ContextPtr & context);
+
 protected:
+    friend class ReadFromURL;
+
     IStorageURLBase(
         const String & uri_,
-        ContextPtr context_,
+        const ContextPtr & context_,
         const StorageID & id_,
         const String & format_name_,
         const std::optional<FormatSettings> & format_settings_,
@@ -94,7 +109,7 @@ protected:
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
         const SelectQueryInfo & query_info,
-        ContextPtr context,
+        const ContextPtr & context,
         QueryProcessingStage::Enum & processed_stage,
         size_t max_block_size) const;
 
@@ -102,43 +117,35 @@ protected:
         const Names & column_names,
         const ColumnsDescription & columns_description,
         const SelectQueryInfo & query_info,
-        ContextPtr context,
+        const ContextPtr & context,
         QueryProcessingStage::Enum & processed_stage,
         size_t max_block_size) const;
 
-    bool supportsSubsetOfColumns() const override;
+    virtual bool supportsSubsetOfColumns(const ContextPtr & context) const;
 
     bool prefersLargeBlocks() const override;
 
     bool parallelizeOutputAfterReading(ContextPtr context) const override;
 
+    bool supportsTrivialCountOptimization(const StorageSnapshotPtr &, ContextPtr) const override { return true; }
+
 private:
+    static std::pair<ColumnsDescription, String> getTableStructureAndFormatFromDataImpl(
+        std::optional<String> format,
+        const String & uri,
+        CompressionMethod compression_method,
+        const HTTPHeaderEntries & headers,
+        const std::optional<FormatSettings> & format_settings,
+        const ContextPtr & context);
+
     virtual Block getHeaderBlock(const Names & column_names, const StorageSnapshotPtr & storage_snapshot) const = 0;
-
-    static std::optional<ColumnsDescription> tryGetColumnsFromCache(
-        const Strings & urls,
-        const HTTPHeaderEntries & headers,
-        const Poco::Net::HTTPBasicCredentials & credentials,
-        const String & format_name,
-        const std::optional<FormatSettings> & format_settings,
-        const ContextPtr & context);
-
-    static void addColumnsToCache(
-        const Strings & urls,
-        const ColumnsDescription & columns,
-        const String & format_name,
-        const std::optional<FormatSettings> & format_settings,
-        const ContextPtr & context);
-
-    static std::optional<time_t> getLastModificationTime(
-        const String & url,
-        const HTTPHeaderEntries & headers,
-        const Poco::Net::HTTPBasicCredentials & credentials,
-        const ContextPtr & context);
 };
 
+bool urlWithGlobs(const String & uri);
 
-class StorageURLSource : public ISource
+String getSampleURI(String uri, ContextPtr context);
+
+class StorageURLSource : public SourceWithKeyCondition, WithContext
 {
     using URIParams = std::vector<std::pair<String, String>>;
 
@@ -146,7 +153,8 @@ public:
     class DisclosedGlobIterator
     {
     public:
-        DisclosedGlobIterator(const String & uri_, size_t max_addresses);
+        DisclosedGlobIterator(const String & uri_, size_t max_addresses, const ActionsDAG::Node * predicate, const NamesAndTypesList & virtual_columns, const ContextPtr & context);
+
         String next();
         size_t size();
     private:
@@ -166,16 +174,24 @@ public:
         const String & format,
         const std::optional<FormatSettings> & format_settings,
         String name_,
-        ContextPtr context,
+        const ContextPtr & context,
         UInt64 max_block_size,
         const ConnectionTimeouts & timeouts,
         CompressionMethod compression_method,
-        size_t download_threads,
+        size_t max_parsing_threads,
         const HTTPHeaderEntries & headers_ = {},
         const URIParams & params = {},
-        bool glob_url = false);
+        bool glob_url = false,
+        bool need_only_count_ = false);
+
+    ~StorageURLSource() override;
 
     String getName() const override { return name; }
+
+    void setKeyCondition(const std::optional<ActionsDAG> & filter_actions_dag, ContextPtr context_) override
+    {
+        setKeyConditionImpl(filter_actions_dag, context_, block_for_format);
+    }
 
     Chunk generate() override;
 
@@ -195,23 +211,36 @@ public:
         bool delay_initialization);
 
 private:
+    void addNumRowsToCache(const String & uri, size_t num_rows);
+    std::optional<size_t> tryGetNumRowsFromCache(const String & uri, std::optional<time_t> last_mod_time);
+
     using InitializeFunc = std::function<bool()>;
     InitializeFunc initialize;
 
     String name;
     ColumnsDescription columns_description;
     NamesAndTypesList requested_columns;
+    bool need_headers_virtual_column;
     NamesAndTypesList requested_virtual_columns;
     Block block_for_format;
     std::shared_ptr<IteratorWrapper> uri_iterator;
     Poco::URI curr_uri;
+    std::optional<size_t> current_file_size;
+    String format;
+    const std::optional<FormatSettings> & format_settings;
+    HTTPHeaderEntries headers;
+    bool need_only_count;
+    size_t total_rows_in_file = 0;
+
+    Poco::Net::HTTPBasicCredentials credentials;
+
+    Map http_response_headers;
+    bool http_response_headers_initialized = false;
 
     std::unique_ptr<ReadBuffer> read_buf;
     std::shared_ptr<IInputFormat> input_format;
     std::unique_ptr<QueryPipeline> pipeline;
     std::unique_ptr<PullingPipelineExecutor> reader;
-
-    Poco::Net::HTTPBasicCredentials credentials;
 };
 
 class StorageURLSink : public SinkToStorage
@@ -222,25 +251,25 @@ public:
         const String & format,
         const std::optional<FormatSettings> & format_settings,
         const Block & sample_block,
-        ContextPtr context,
+        const ContextPtr & context,
         const ConnectionTimeouts & timeouts,
         CompressionMethod compression_method,
         const HTTPHeaderEntries & headers = {},
         const String & method = Poco::Net::HTTPRequest::HTTP_POST);
 
+    ~StorageURLSink() override;
+
     std::string getName() const override { return "StorageURLSink"; }
-    void consume(Chunk chunk) override;
-    void onCancel() override;
-    void onException(std::exception_ptr exception) override;
+    void consume(Chunk & chunk) override;
     void onFinish() override;
 
 private:
-    void finalize();
-    void release();
+    void finalizeBuffers();
+    void releaseBuffers();
+    void cancelBuffers();
+
     std::unique_ptr<WriteBuffer> write_buf;
     OutputFormatPtr writer;
-    std::mutex cancel_mutex;
-    bool cancelled = false;
 };
 
 class StorageURL : public IStorageURLBase
@@ -254,7 +283,7 @@ public:
         const ColumnsDescription & columns_,
         const ConstraintsDescription & constraints_,
         const String & comment,
-        ContextPtr context_,
+        const ContextPtr & context_,
         const String & compression_method_,
         const HTTPHeaderEntries & headers_ = {},
         const String & method_ = "",
@@ -272,6 +301,9 @@ public:
     }
 
     bool supportsSubcolumns() const override { return true; }
+    bool supportsOptimizationToSubcolumns() const override { return false; }
+
+    bool supportsDynamicSubcolumns() const override { return true; }
 
     static FormatSettings getFormatSettingsFromArgs(const StorageFactory::Arguments & args);
 
@@ -283,9 +315,12 @@ public:
         std::string addresses_expr;
     };
 
-    static Configuration getConfiguration(ASTs & args, ContextPtr context);
+    static Configuration getConfiguration(ASTs & args, const ContextPtr & context);
 
-    static ASTs::iterator collectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, ContextPtr context);
+    /// Does evaluateConstantExpressionOrIdentifierAsLiteral() on all arguments.
+    /// If `headers(...)` argument is present, parses it and moves it to the end of the array.
+    /// Returns number of arguments excluding `headers(...)`.
+    static size_t evalArgsAndCollectHeaders(ASTs & url_function_args, HTTPHeaderEntries & header_entries, const ContextPtr & context);
 
     static void processNamedCollectionResult(Configuration & configuration, const NamedCollection & collection);
 };
@@ -302,10 +337,11 @@ public:
         const std::optional<FormatSettings> & format_settings_,
         const ColumnsDescription & columns_,
         const ConstraintsDescription & constraints_,
-        ContextPtr context_,
+        const ContextPtr & context_,
         const String & compression_method_);
 
-    Pipe read(
+    void read(
+        QueryPlan & query_plan,
         const Names & column_names,
         const StorageSnapshotPtr & storage_snapshot,
         SelectQueryInfo & query_info,

@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <span>
 #include <functional>
 
 /** Generic interface for ZooKeeper-like services.
@@ -17,6 +18,13 @@
   * - ZooKeeper emulation layer on top of Etcd, FoundationDB, whatever.
   */
 
+namespace DB
+{
+namespace ErrorCodes
+{
+    extern const int KEEPER_EXCEPTION;
+}
+}
 
 namespace Coordination
 {
@@ -102,7 +110,8 @@ enum class Error : int32_t
     ZAUTHFAILED = -115,                 /// Client authentication failed
     ZCLOSING = -116,                    /// ZooKeeper is closing
     ZNOTHING = -117,                    /// (not error) no server responses to process
-    ZSESSIONMOVED = -118                /// Session moved to another server, so operation is ignored
+    ZSESSIONMOVED = -118,               /// Session moved to another server, so operation is ignored
+    ZNOTREADONLY = -119,                /// State-changing request is passed to read-only server
 };
 
 /// Network errors and similar. You should reinitialize ZooKeeper session in case of these errors
@@ -158,6 +167,10 @@ struct WatchResponse : virtual Response
 };
 
 using WatchCallback = std::function<void(const WatchResponse &)>;
+/// Passing watch callback as a shared_ptr allows to
+///  - avoid copying of the callback
+///  - registering the same callback only once per path
+using WatchCallbackPtr = std::shared_ptr<WatchCallback>;
 
 struct SetACLRequest : virtual Request
 {
@@ -201,6 +214,9 @@ struct CreateRequest : virtual Request
     bool is_sequential = false;
     ACLs acls;
 
+    /// should it succeed if node already exists
+    bool not_exists = false;
+
     void addRootPath(const String & root_path) override;
     String getPath() const override { return path; }
 
@@ -229,6 +245,23 @@ struct RemoveRequest : virtual Request
 };
 
 struct RemoveResponse : virtual Response
+{
+};
+
+struct RemoveRecursiveRequest : virtual Request
+{
+    String path;
+
+    /// strict limit for number of deleted nodes
+    uint32_t remove_nodes_limit = 1;
+
+    void addRootPath(const String & root_path) override;
+    String getPath() const override { return path; }
+
+    size_t bytesSize() const override { return path.size() + sizeof(remove_nodes_limit); }
+};
+
+struct RemoveRecursiveResponse : virtual Response
 {
 };
 
@@ -375,11 +408,17 @@ struct ReconfigResponse : virtual Response
     size_t bytesSize() const override { return value.size() + sizeof(stat); }
 };
 
+template <typename T>
 struct MultiRequest : virtual Request
 {
-    Requests requests;
+    std::vector<T> requests;
 
-    void addRootPath(const String & root_path) override;
+    void addRootPath(const String & root_path) override
+    {
+        for (auto & request : requests)
+            request->addRootPath(root_path);
+    }
+
     String getPath() const override { return {}; }
 
     size_t bytesSize() const override
@@ -414,6 +453,7 @@ struct ErrorResponse : virtual Response
 
 using CreateCallback = std::function<void(const CreateResponse &)>;
 using RemoveCallback = std::function<void(const RemoveResponse &)>;
+using RemoveRecursiveCallback = std::function<void(const RemoveRecursiveResponse &)>;
 using ExistsCallback = std::function<void(const ExistsResponse &)>;
 using GetCallback = std::function<void(const GetResponse &)>;
 using SetCallback = std::function<void(const SetResponse &)>;
@@ -431,6 +471,7 @@ enum State
     CONNECTING = 1,
     ASSOCIATING = 2,
     CONNECTED = 3,
+    READONLY = 5,
     NOTCONNECTED = 999
 };
 
@@ -449,18 +490,47 @@ class Exception : public DB::Exception
 {
 private:
     /// Delegate constructor, used to minimize repetition; last parameter used for overload resolution.
-    Exception(const std::string & msg, const Error code_, int); /// NOLINT
+    Exception(const std::string & msg, Error code_, int); /// NOLINT
+    Exception(PreformattedMessage && msg, Error code_);
+
+    /// Message must be a compile-time constant
+    template <typename T>
+    requires std::is_convertible_v<T, String>
+    Exception(T && message, Error code_) : DB::Exception(std::forward<T>(message), DB::ErrorCodes::KEEPER_EXCEPTION, /* remote_= */ false), code(code_)
+    {
+        incrementErrorMetrics(code);
+    }
+
+    static void incrementErrorMetrics(Error code_);
 
 public:
-    explicit Exception(const Error code_); /// NOLINT
-    Exception(const std::string & msg, const Error code_); /// NOLINT
-    Exception(const Error code_, const std::string & path); /// NOLINT
+    explicit Exception(Error code_); /// NOLINT
     Exception(const Exception & exc);
 
     template <typename... Args>
-    Exception(const Error code_, fmt::format_string<Args...> fmt, Args &&... args)
-        : Exception(fmt::format(fmt, std::forward<Args>(args)...), code_)
+    Exception(Error code_, FormatStringHelper<Args...> fmt, Args &&... args)
+        : DB::Exception(DB::ErrorCodes::KEEPER_EXCEPTION, std::move(fmt), std::forward<Args>(args)...)
+        , code(code_)
     {
+        incrementErrorMetrics(code);
+    }
+
+    static Exception createDeprecated(const std::string & msg, Error code_)
+    {
+        return Exception(msg, code_, 0);
+    }
+
+    static Exception fromPath(Error code_, const std::string & path)
+    {
+        return Exception(code_, "Coordination error: {}, path {}", errorMessage(code_), path);
+    }
+
+    /// Message must be a compile-time constant
+    template <typename T>
+    requires std::is_convertible_v<T, String>
+    static Exception fromMessage(Error code_, T && message)
+    {
+        return Exception(std::forward<T>(message), code_);
     }
 
     const char * name() const noexcept override { return "Coordination::Exception"; }
@@ -468,6 +538,18 @@ public:
     Exception * clone() const override { return new Exception(*this); }
 
     const Error code;
+};
+
+class SimpleFaultInjection
+{
+public:
+    SimpleFaultInjection(Float64 probability_before, Float64 probability_after_, const String & description_);
+    ~SimpleFaultInjection() noexcept(false);
+
+private:
+    Float64 probability_after = 0;
+    String description;
+    int exceptions_level = 0;
 };
 
 
@@ -489,8 +571,19 @@ public:
     /// If expired, you can only destroy the object. All other methods will throw exception.
     virtual bool isExpired() const = 0;
 
+    /// Get the current connected node idx.
+    virtual std::optional<int8_t> getConnectedNodeIdx() const = 0;
+
+    /// Get the current connected host and port.
+    virtual String getConnectedHostPort() const = 0;
+
+    /// Get the xid of current connection.
+    virtual int64_t getConnectionXid() const = 0;
+
     /// Useful to check owner of ephemeral node.
     virtual int64_t getSessionID() const = 0;
+
+    virtual String tryGetAvailabilityZone() { return ""; }
 
     /// If the method will throw an exception, callbacks won't be called.
     ///
@@ -518,15 +611,20 @@ public:
         int32_t version,
         RemoveCallback callback) = 0;
 
+    virtual void removeRecursive(
+        const String & path,
+        uint32_t remove_nodes_limit,
+        RemoveRecursiveCallback callback) = 0;
+
     virtual void exists(
         const String & path,
         ExistsCallback callback,
-        WatchCallback watch) = 0;
+        WatchCallbackPtr watch) = 0;
 
     virtual void get(
         const String & path,
         GetCallback callback,
-        WatchCallback watch) = 0;
+        WatchCallbackPtr watch) = 0;
 
     virtual void set(
         const String & path,
@@ -538,7 +636,7 @@ public:
         const String & path,
         ListRequestType list_request_type,
         ListCallback callback,
-        WatchCallback watch) = 0;
+        WatchCallbackPtr watch) = 0;
 
     virtual void check(
         const String & path,
@@ -557,16 +655,16 @@ public:
         ReconfigCallback callback) = 0;
 
     virtual void multi(
+        std::span<const RequestPtr> requests,
+        MultiCallback callback) = 0;
+
+    virtual void multi(
         const Requests & requests,
         MultiCallback callback) = 0;
 
     virtual bool isFeatureEnabled(DB::KeeperFeatureFlag feature_flag) const = 0;
 
     virtual const DB::KeeperFeatureFlags * getKeeperFeatureFlags() const { return nullptr; }
-
-    /// A ZooKeeper session can have an optional deadline set on it.
-    /// After it has been reached, the session needs to be finalized.
-    virtual bool hasReachedDeadline() const = 0;
 
     /// Expire session and finish all pending requests
     virtual void finalize(const String & reason) = 0;
@@ -576,7 +674,7 @@ public:
 
 template <> struct fmt::formatter<Coordination::Error> : fmt::formatter<std::string_view>
 {
-    constexpr auto format(Coordination::Error code, auto & ctx)
+    constexpr auto format(Coordination::Error code, auto & ctx) const
     {
         return formatter<string_view>::format(Coordination::errorMessage(code), ctx);
     }

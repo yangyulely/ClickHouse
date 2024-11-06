@@ -2,7 +2,7 @@
 #include <base/find_symbols.h>
 #include <IO/ReadHelpers.h>
 #include <Columns/ColumnString.h>
-
+#include <Formats/FormatFactory.h>
 
 namespace DB
 {
@@ -51,6 +51,18 @@ bool LineAsStringRowInputFormat::readRow(MutableColumns & columns, RowReadExtens
     return true;
 }
 
+size_t LineAsStringRowInputFormat::countRows(size_t max_block_size)
+{
+    size_t num_rows = 0;
+    while (!in->eof() && num_rows < max_block_size)
+    {
+        skipToNextLineOrEOF(*in);
+        ++num_rows;
+    }
+
+    return num_rows;
+}
+
 void registerInputFormatLineAsString(FormatFactory & factory)
 {
     factory.registerInputFormat("LineAsString", [](
@@ -75,7 +87,7 @@ static std::pair<bool, size_t> segmentationEngine(ReadBuffer & in, DB::Memory<> 
         pos = find_first_symbols<'\n'>(pos, in.buffer().end());
         if (pos > in.buffer().end())
             throw Exception(ErrorCodes::LOGICAL_ERROR, "Position in buffer is out of bounds. There must be a bug.");
-        else if (pos == in.buffer().end())
+        if (pos == in.buffer().end())
             continue;
 
         ++number_of_rows;

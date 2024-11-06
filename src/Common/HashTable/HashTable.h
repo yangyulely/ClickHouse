@@ -67,19 +67,6 @@ struct HashTableNoState
 };
 
 
-/// These functions can be overloaded for custom types.
-namespace ZeroTraits
-{
-
-template <typename T>
-bool check(const T x) { return x == T{}; }
-
-template <typename T>
-void set(T & x) { x = T{}; }
-
-}
-
-
 /** Numbers are compared bitwise.
   * Complex types are compared by operator== as usual (this is important if there are gaps).
   *
@@ -87,14 +74,29 @@ void set(T & x) { x = T{}; }
   * Otherwise the invariants in hash table probing do not met when NaNs are present.
   */
 template <typename T>
-inline bool bitEquals(T && a, T && b)
+inline bool bitEquals(T a, T b)
 {
-    using RealT = std::decay_t<T>;
-
-    if constexpr (std::is_floating_point_v<RealT>)
-        return 0 == memcmp(&a, &b, sizeof(RealT));  /// Note that memcmp with constant size is compiler builtin.
+    if constexpr (std::is_floating_point_v<T>)
+        /// Note that memcmp with constant size is a compiler builtin.
+        return 0 == memcmp(&a, &b, sizeof(T)); /// NOLINT
     else
         return a == b;
+}
+
+
+/// These functions can be overloaded for custom types.
+namespace ZeroTraits
+{
+
+template <typename T>
+bool check(const T x)
+{
+    return bitEquals(x, T{});
+}
+
+template <typename T>
+void set(T & x) { x = T{}; }
+
 }
 
 
@@ -201,11 +203,11 @@ struct HashTableCell
     void setMapped(const value_type & /*value*/) {}
 
     /// Serialization, in binary and text form.
-    void write(DB::WriteBuffer & wb) const         { DB::writeBinary(key, wb); }
+    void write(DB::WriteBuffer & wb) const         { DB::writeBinaryLittleEndian(key, wb); }
     void writeText(DB::WriteBuffer & wb) const     { DB::writeDoubleQuoted(key, wb); }
 
     /// Deserialization, in binary and text form.
-    void read(DB::ReadBuffer & rb)        { DB::readBinary(key, rb); }
+    void read(DB::ReadBuffer & rb)        { DB::readBinaryLittleEndian(key, rb); }
     void readText(DB::ReadBuffer & rb)    { DB::readDoubleQuoted(key, rb); }
 
     /// When cell pointer is moved during erase, reinsert or resize operations
@@ -644,7 +646,7 @@ protected:
 
         /// Copy to a new location and zero the old one.
         x.setHash(hash_value);
-        memcpy(static_cast<void*>(&buf[place_value]), &x, sizeof(x));
+        memcpy(static_cast<void*>(&buf[place_value]), &x, sizeof(x)); /// NOLINT(bugprone-undefined-memory-manipulation)
         x.setZero();
 
         /// Then the elements that previously were in collision with this can move to the old place.
@@ -843,7 +845,7 @@ public:
             return true;
         }
 
-        inline const value_type & get() const
+        const value_type & get() const
         {
             if (!is_initialized || is_eof)
                 throw DB::Exception(DB::ErrorCodes::NO_AVAILABLE_DATA, "No available data");
@@ -853,7 +855,7 @@ public:
 
     private:
         DB::ReadBuffer & in;
-        Cell cell;
+        Cell cell{};
         size_t read_count = 0;
         size_t size = 0;
         bool is_eof = false;
@@ -997,6 +999,7 @@ protected:
                 --m_size;
                 buf[place_value].setZero();
                 inserted = false;
+                keyHolderDiscardKey(key_holder);
                 throw;
             }
 
@@ -1164,10 +1167,8 @@ public:
                 this->clearHasZero();
                 return true;
             }
-            else
-            {
-                return false;
-            }
+
+            return false;
         }
 
         size_t erased_key_position = findCell(x, hash_value, grower.place(hash_value));
@@ -1273,6 +1274,10 @@ public:
         return !buf[place_value].isZero(*this);
     }
 
+    bool ALWAYS_INLINE contains(const Key & x) const
+    {
+        return has(x);
+    }
 
     void write(DB::WriteBuffer & wb) const
     {

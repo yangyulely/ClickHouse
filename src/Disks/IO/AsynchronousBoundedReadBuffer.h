@@ -27,6 +27,7 @@ public:
         ImplPtr impl_,
         IAsynchronousReader & reader_,
         const ReadSettings & settings_,
+        size_t buffer_size_,
         AsyncReadCountersPtr async_read_counters_ = nullptr,
         FilesystemReadPrefetchesLogPtr prefetches_log_ = nullptr);
 
@@ -34,7 +35,7 @@ public:
 
     String getFileName() const override { return impl->getFileName(); }
 
-    size_t getFileSize() override { return impl->getFileSize(); }
+    std::optional<size_t> tryGetFileSize() override { return impl->tryGetFileSize(); }
 
     String getInfoForLog() override { return impl->getInfoForLog(); }
 
@@ -44,13 +45,16 @@ public:
 
     void setReadUntilPosition(size_t position) override; /// [..., position).
 
-    void setReadUntilEnd() override { return setReadUntilPosition(getFileSize()); }
+    void setReadUntilEnd() override { setReadUntilPosition(getFileSize()); }
+
+    size_t getFileOffsetOfBufferEnd() const override  { return file_offset_of_buffer_end; }
 
     off_t getPosition() override { return file_offset_of_buffer_end - available() + bytes_to_ignore; }
 
 private:
     const ImplPtr impl;
     const ReadSettings read_settings;
+    const size_t buffer_size;
     IAsynchronousReader & reader;
 
     size_t file_offset_of_buffer_end = 0;
@@ -65,7 +69,7 @@ private:
     const std::string query_id;
     const std::string current_reader_id;
 
-    Poco::Logger * log;
+    LoggerPtr log;
 
     AsyncReadCountersPtr async_read_counters;
     FilesystemReadPrefetchesLogPtr prefetches_log;
@@ -88,10 +92,11 @@ private:
         int64_t size,
         const std::unique_ptr<Stopwatch> & execution_watch);
 
-    std::future<IAsynchronousReader::Result> asyncReadInto(char * data, size_t size, Priority priority);
+    std::future<IAsynchronousReader::Result> readAsync(char * data, size_t size, Priority priority);
+
+    IAsynchronousReader::Result readSync(char * data, size_t size);
 
     void resetPrefetch(FilesystemPrefetchState state);
-
 };
 
 }
